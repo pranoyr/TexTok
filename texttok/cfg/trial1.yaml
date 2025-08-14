@@ -15,7 +15,7 @@ model:
 dataset:
     name: coco
     params:
-        root_path:  /media/pranoy/Datasets/coco-dataset/coco
+        root_path:  /mnt/datasets/coco-dataset/coco
         num_workers: 4
         pin_memory: True
         batch_size: 1

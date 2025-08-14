@@ -1,296 +1,481 @@
-# TexTok: Text-Conditioned Image Tokenization (PyTorch)
-# pip install torch torchvision transformers lpips  (lpips optional)
-from typing import List, Optional, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import T5EncoderModel, T5TokenizerFast
+from transformers import T5EncoderModel, T5Tokenizer
+import math
 
-# ----------------------------
-# Basic building blocks
-# ----------------------------
 
 class PatchEmbed(nn.Module):
-    """Image -> patch tokens (B, hw, D)."""
-    def __init__(self, in_ch=3, patch=8, dim=768):
+    """2D Image to Patch Embedding"""
+    def __init__(self, img_size=256, patch_size=8, in_chans=3, embed_dim=768):
         super().__init__()
-        self.patch = patch
-        self.proj = nn.Conv2d(in_ch, dim, kernel_size=patch, stride=patch)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
+        self.num_patches = self.grid_size ** 2
+        
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
-        # x: (B,3,H,W) -> (B,D,H/p,W/p) -> (B, hw, D)
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
+        B, C, H, W = x.shape
+        x = self.proj(x)  # (B, embed_dim, H//patch_size, W//patch_size)
+        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
         return x
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 
 class MLP(nn.Module):
-    def __init__(self, dim, mlp_dim):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
-        self.fc1 = nn.Linear(dim, mlp_dim)
-        self.fc2 = nn.Linear(mlp_dim, dim)
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x)))
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim=768, heads=12, mlp_dim=3072, dropout=0.0):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
         super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=dropout)
-        self.ln2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=drop)
 
     def forward(self, x):
-        h = x
-        x = self.ln1(x)
-        x, _ = self.attn(x, x, x, need_weights=False)
-        x = x + h
-        h = x
-        x = self.ln2(x)
-        x = self.mlp(x)
-        x = x + h
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
-class ViT1D(nn.Module):
-    """Transformer over a single token sequence."""
-    def __init__(self, dim=768, depth=12, heads=12, mlp_dim=3072, dropout=0.0):
+
+class TexTokTokenizer(nn.Module):
+    """TexTok Tokenizer (Encoder) with text conditioning"""
+    def __init__(self, 
+                 img_size=256, 
+                 patch_size=8, 
+                 in_chans=3, 
+                 embed_dim=768, 
+                 depth=12, 
+                 num_heads=12, 
+                 num_tokens=128,
+                 token_dim=8,
+                 text_dim=768,
+                 max_text_len=128):
         super().__init__()
+        self.num_tokens = num_tokens
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        
+        # Learnable image tokens
+        self.image_tokens = nn.Parameter(torch.randn(1, num_tokens, embed_dim))
+        
+        # Text projection
+        self.text_proj = nn.Linear(text_dim, embed_dim)
+        
+        # Positional embeddings (not used for global tokens but kept for compatibility)
+        num_patches = self.patch_embed.num_patches
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + num_tokens + max_text_len, embed_dim))
+        
+        # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(dim, heads, mlp_dim, dropout) for _ in range(depth)
+            TransformerBlock(embed_dim, num_heads) for _ in range(depth)
         ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Output projection for image tokens
+        self.token_proj = nn.Linear(embed_dim, token_dim)
+        
+    def forward(self, x, text_embeds):
+        B = x.shape[0]
+        
+        # Patch embedding
+        patch_tokens = self.patch_embed(x)  # (B, num_patches, embed_dim)
+        
+        # Expand learnable image tokens
+        image_tokens = self.image_tokens.expand(B, -1, -1)  # (B, num_tokens, embed_dim)
+        
+        # Project text embeddings
+        text_tokens = self.text_proj(text_embeds)  # (B, text_len, embed_dim)
+        
+        # Concatenate all tokens: [patch_tokens, image_tokens, text_tokens]
+        tokens = torch.cat([patch_tokens, image_tokens, text_tokens], dim=1)
+        
+        # Add positional embeddings
+        tokens = tokens + self.pos_embed[:, :tokens.shape[1], :]
+        
+        # Apply transformer blocks
+        for block in self.blocks:
+            tokens = block(tokens)
+        
+        tokens = self.norm(tokens)
+        
+        # Extract only the image tokens
+        start_idx = patch_tokens.shape[1]
+        end_idx = start_idx + self.num_tokens
+        image_tokens_out = tokens[:, start_idx:end_idx]
+        
+        # Project to final token dimension
+        image_tokens_out = self.token_proj(image_tokens_out)
+        
+        return image_tokens_out
 
+
+class TexTokDetokenizer(nn.Module):
+    """TexTok Detokenizer (Decoder) with text conditioning"""
+    def __init__(self, 
+                 img_size=256, 
+                 patch_size=8, 
+                 out_chans=3, 
+                 embed_dim=768, 
+                 depth=12, 
+                 num_heads=12, 
+                 num_tokens=128,
+                 token_dim=8,
+                 text_dim=768,
+                 max_text_len=128):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = img_size // patch_size
+        self.num_patches = self.grid_size ** 2
+        
+        # Learnable patch tokens
+        self.patch_tokens = nn.Parameter(torch.randn(1, self.num_patches, embed_dim))
+        
+        # Input projections
+        self.token_proj = nn.Linear(token_dim, embed_dim)
+        self.text_proj = nn.Linear(text_dim, embed_dim)
+        
+        # Positional embeddings
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + num_tokens + max_text_len, embed_dim))
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # Output projection and unpatchify
+        self.output_proj = nn.Linear(embed_dim, patch_size * patch_size * out_chans)
+        
+    def unpatchify(self, x):
+        """Convert patch tokens back to image"""
+        p = self.patch_size
+        h = w = self.grid_size
+        x = x.reshape(x.shape[0], h, w, p, p, -1)
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(x.shape[0], -1, h * p, w * p)
+        return imgs
+        
+    def forward(self, image_tokens, text_embeds):
+        B = image_tokens.shape[0]
+        
+        # Expand learnable patch tokens
+        patch_tokens = self.patch_tokens.expand(B, -1, -1)  # (B, num_patches, embed_dim)
+        
+        # Project input tokens
+        image_tokens_proj = self.token_proj(image_tokens)  # (B, num_tokens, embed_dim)
+        text_tokens = self.text_proj(text_embeds)  # (B, text_len, embed_dim)
+        
+        # Concatenate all tokens: [patch_tokens, image_tokens, text_tokens]
+        tokens = torch.cat([patch_tokens, image_tokens_proj, text_tokens], dim=1)
+        
+        # Add positional embeddings
+        tokens = tokens + self.pos_embed[:, :tokens.shape[1], :]
+        
+        # Apply transformer blocks
+        for block in self.blocks:
+            tokens = block(tokens)
+        
+        tokens = self.norm(tokens)
+        
+        # Extract only the patch tokens
+        patch_tokens_out = tokens[:, :self.num_patches]
+        
+        # Project to pixel space
+        patch_tokens_out = self.output_proj(patch_tokens_out)
+        
+        # Unpatchify to get final image
+        images = self.unpatchify(patch_tokens_out)
+        
+        return images
+
+
+class TexTokVAE(nn.Module):
+    """Complete TexTok AutoEncoder"""
+    def __init__(self, 
+                 img_size=256,
+                 patch_size=8,
+                 num_tokens=128,
+                 token_dim=8,
+                 embed_dim=768,
+                 depth=12,
+                 num_heads=12,
+                 text_encoder_name="t5-base",
+                 max_text_len=128):
+        super().__init__()
+        
+        # Text encoder (frozen)
+        self.text_tokenizer = T5Tokenizer.from_pretrained(text_encoder_name)
+        self.text_encoder = T5EncoderModel.from_pretrained(text_encoder_name)
+        
+        # Freeze text encoder
+        for param in self.text_encoder.parameters():
+            param.requires_grad = False
+            
+        text_dim = self.text_encoder.config.d_model
+        
+        # Tokenizer and Detokenizer
+        self.tokenizer = TexTokTokenizer(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            num_tokens=num_tokens,
+            token_dim=token_dim,
+            text_dim=text_dim,
+            max_text_len=max_text_len
+        )
+        
+        self.detokenizer = TexTokDetokenizer(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            num_tokens=num_tokens,
+            token_dim=token_dim,
+            text_dim=text_dim,
+            max_text_len=max_text_len
+        )
+        
+    def encode_text(self, captions):
+        """Encode text captions using T5"""
+        if isinstance(captions[0], str):
+            # Tokenize text
+            inputs = self.text_tokenizer(
+                captions, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True,
+                max_length=128
+            )
+            input_ids = inputs.input_ids.to(next(self.parameters()).device)
+            attention_mask = inputs.attention_mask.to(next(self.parameters()).device)
+        else:
+            input_ids = captions
+            attention_mask = None
+            
+        # Get text embeddings
+        with torch.no_grad():
+            outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            text_embeds = outputs.last_hidden_state
+            
+        return text_embeds
+        
+    def encode(self, images, captions):
+        """Encode images to tokens"""
+        text_embeds = self.encode_text(captions)
+        tokens = self.tokenizer(images, text_embeds)
+        return tokens
+        
+    def decode(self, tokens, captions):
+        """Decode tokens to images"""
+        text_embeds = self.encode_text(captions)
+        images = self.detokenizer(tokens, text_embeds)
+        return images
+        
+    def forward(self, images, captions):
+        """Full forward pass"""
+        tokens = self.encode(images, captions)
+        reconstructed = self.decode(tokens, captions)
+        return reconstructed, tokens
+
+
+# Discriminator for GAN training (StyleGAN-style)
+class StyleGANDiscriminator(nn.Module):
+    """StyleGAN-style discriminator for TexTok training"""
+    def __init__(self, img_size=256, img_channels=3, base_channels=128, channel_multipliers=[1, 2, 4, 4, 4, 4]):
+        super().__init__()
+        
+        self.img_size = img_size
+        layers = []
+        in_channels = img_channels
+        
+        # Initial layer
+        layers.append(nn.Conv2d(in_channels, base_channels, 3, 1, 1))
+        layers.append(nn.LeakyReLU(0.2))
+        
+        current_size = img_size
+        in_channels = base_channels
+        
+        # Downsampling layers
+        for multiplier in channel_multipliers:
+            out_channels = base_channels * multiplier
+            
+            layers.append(nn.Conv2d(in_channels, out_channels, 3, 1, 1))
+            layers.append(nn.LeakyReLU(0.2))
+            layers.append(nn.Conv2d(out_channels, out_channels, 3, 2, 1))
+            layers.append(nn.LeakyReLU(0.2))
+            
+            in_channels = out_channels
+            current_size //= 2
+            
+        self.conv_layers = nn.Sequential(*layers)
+        
+        # Final layers
+        self.final_conv = nn.Conv2d(in_channels, in_channels, 3, 1, 1)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+        self.final_linear = nn.Linear(in_channels, 1)
+        
     def forward(self, x):
-        for blk in self.blocks:
-            x = blk(x)
+        x = self.conv_layers(x)
+        x = self.final_conv(x)
+        x = self.adaptive_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.final_linear(x)
         return x
 
-# ----------------------------
-# TexTok model (encoder + detokenizer)
-# ----------------------------
 
-class TexTok(nn.Module):
-    """
-    In-context text conditioning (concat text tokens into self-attn stream).
-    - Encoder input: [image_patches, learnable_image_tokens, text_tokens]
-    - Decoder input: [learnable_patch_tokens, image_tokens(projected), text_tokens]
-    Produces N continuous tokens of size d.
-    """
-    def __init__(
-        self,
-        img_res: int = 256,
-        patch: int = 8,
-        dim: int = 768,
-        depth: int = 12,
-        heads: int = 12,
-        mlp_dim: int = 3072,
-        num_image_tokens: int = 128,   # N
-        out_token_dim: int = 8,        # d
-        t5_model: str = "t5-3b",
-        freeze_t5: bool = True,
-        dropout: float = 0.0,
-        max_txt_len: int = 128,
-    ):
+# Example usage and training utilities
+def create_textok_model(config):
+    """Create TexTok model with given configuration"""
+    model = TexTokVAE(
+        img_size=config.get('img_size', 256),
+        patch_size=config.get('patch_size', 8),
+        num_tokens=config.get('num_tokens', 128),
+        token_dim=config.get('token_dim', 8),
+        embed_dim=config.get('embed_dim', 768),
+        depth=config.get('depth', 12),
+        num_heads=config.get('num_heads', 12),
+        text_encoder_name=config.get('text_encoder_name', 't5-base'),
+        max_text_len=config.get('max_text_len', 128)
+    )
+    return model
+
+
+# Loss functions
+class TexTokLoss(nn.Module):
+    """Combined loss for TexTok training"""
+    def __init__(self, 
+                 recon_weight=1.0,
+                 perceptual_weight=0.1,
+                 gan_weight=0.1,
+                 lecam_weight=0.0001):
         super().__init__()
-        self.dim = dim
-        self.N = num_image_tokens
-        self.d = out_token_dim
-        self.patch = patch
-        self.max_txt_len = max_txt_len
-
-        # Text encoder (frozen)
-        self.tok = T5TokenizerFast.from_pretrained(t5_model)
-        self.t5 = T5EncoderModel.from_pretrained(t5_model)
-        if freeze_t5:
-            for p in self.t5.parameters():
-                p.requires_grad = False
-        t5_w = self.t5.config.d_model
-
-        # Project text -> model dim (separate projections for enc/dec)
-        self.txt_proj_enc = nn.Linear(t5_w, dim)
-        self.txt_proj_dec = nn.Linear(t5_w, dim)
-
-        # Patch embed / unpatch
-        self.embed = PatchEmbed(3, patch, dim)
-        hw = (img_res // patch) * (img_res // patch)
-        self.hw = hw
-
-        # Learnable tokens
-        self.learnable_image_tokens = nn.Parameter(torch.randn(1, self.N, dim) * 0.02)
-        self.learnable_patch_tokens = nn.Parameter(torch.randn(1, hw, dim) * 0.02)
-
-        # Encoder/decoder cores
-        self.encoder = ViT1D(dim, depth, heads, mlp_dim, dropout)
-        self.decoder = ViT1D(dim, depth, heads, mlp_dim, dropout)
-
-        # Projections to/from latent (N,d) <-> (N,dim)
-        self.to_latent = nn.Linear(dim, self.d)
-        self.from_latent = nn.Linear(self.d, dim)
-
-        # Predict patches back to pixels
-        self.patch_head = nn.Linear(dim, patch * patch * 3)
-
-    # ---- text helpers ----
-    def encode_text(self, captions: List[str], device) -> torch.Tensor:
-        toks = self.tok(
-            captions, padding=True, truncation=True,
-            max_length=self.max_txt_len, return_tensors="pt"
-        ).to(device)
-        with torch.no_grad():
-            txt = self.t5(**toks).last_hidden_state  # (B, Nt, t5_w)
-        return txt
-
-    # ---- forward paths ----
-    @torch.no_grad()
-    def encode_only(self, images: torch.Tensor, captions: List[str]) -> torch.Tensor:
-        """Return latent tokens Z (B,N,d) without reconstructing."""
-        return self.tokenize(images, captions)
-
-    def tokenize(self, images: torch.Tensor, captions: List[str]) -> torch.Tensor:
-        B, _, H, W = images.shape
-        device = images.device
-
-        P = self.embed(images)  # (B, hw, dim)
-        L = self.learnable_image_tokens.expand(B, -1, -1)  # (B, N, dim)
-
-        T = self.encode_text(captions, device)             # (B, Nt, t5_w)
-        T = self.txt_proj_enc(T)                           # (B, Nt, dim)
-
-        seq = torch.cat([P, L, T], dim=1)                  # (B, hw + N + Nt, dim)
-        seq = self.encoder(seq)
-
-        # Slice back the image-token positions and map to latent d
-        img_slice = seq[:, P.size(1): P.size(1) + L.size(1), :]  # (B, N, dim)
-        Z = self.to_latent(img_slice)                             # (B, N, d)
-        return Z
-
-    def detokenize(self, Z: torch.Tensor, captions: List[str], H: int, W: int) -> torch.Tensor:
-        """Z (B,N,d) -> image (B,3,H,W)."""
-        B = Z.size(0)
-        device = Z.device
-        h, w = H // self.patch, W // self.patch
-        assert h * w == self.hw, "H,W must match init img_res."
-
-        Zp = self.from_latent(Z)                                   # (B, N, dim)
-        Pp = self.learnable_patch_tokens.expand(B, -1, -1)         # (B, hw, dim)
-
-        T = self.encode_text(captions, device)                     # (B, Nt, t5_w)
-        T = self.txt_proj_dec(T)                                   # (B, Nt, dim)
-
-        seq = torch.cat([Pp, Zp, T], dim=1)                        # (B, hw + N + Nt, dim)
-        seq = self.decoder(seq)
-
-        # Take first hw tokens -> per-patch pixel prediction
-        patch_tokens = seq[:, :self.hw, :]                         # (B, hw, dim)
-        px = self.patch_head(patch_tokens)                         # (B, hw, p*p*3)
-        px = px.view(B, h, w, self.patch, self.patch, 3).permute(0,5,1,3,2,4)
-        img = px.reshape(B, 3, H, W).contiguous()
-        # img = img.clamp(0, 1)
-        img = img.clamp(-1, 1)
-
-        return img
-
-    def forward(self, images: torch.Tensor, captions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (Z, recon)."""
-        B, _, H, W = images.shape
-        Z = self.tokenize(images, captions)                  # (B,N,d)
-        recon = self.detokenize(Z, captions, H, W)           # (B,3,H,W)
-        return recon
-
-# ----------------------------
-# Optional: a tiny PatchGAN-style discriminator (very light)
-# ----------------------------
-
-class TinyPatchGAN(nn.Module):
-    def __init__(self, in_ch=3, base=64):
-        super().__init__()
-        # Downsample to a patch map of logits
-        def block(c_in, c_out):
-            return nn.Sequential(
-                nn.Conv2d(c_in, c_out, 4, 2, 1),
-                nn.LeakyReLU(0.2, inplace=True)
-            )
-        self.net = nn.Sequential(
-            block(in_ch, base),
-            block(base, base*2),
-            block(base*2, base*4),
-            nn.Conv2d(base*4, 1, 3, 1, 1)
-        )
-    def forward(self, x):
-        return self.net(x)  # (B,1,h',w')
+        self.recon_weight = recon_weight
+        self.perceptual_weight = perceptual_weight
+        self.gan_weight = gan_weight
+        self.lecam_weight = lecam_weight
+        
+        # Perceptual loss (VGG features)
+        from torchvision.models import vgg16
+        vgg = vgg16(pretrained=True).features
+        self.perceptual_net = nn.Sequential(*list(vgg.children())[:16]).eval()
+        for param in self.perceptual_net.parameters():
+            param.requires_grad = False
+            
+    def perceptual_loss(self, input, target):
+        input_features = self.perceptual_net(input)
+        target_features = self.perceptual_net(target)
+        return F.mse_loss(input_features, target_features)
+        
+    def forward(self, input_images, reconstructed, discriminator_real, discriminator_fake):
+        # Reconstruction loss
+        recon_loss = F.mse_loss(reconstructed, input_images)
+        
+        # Perceptual loss
+        perceptual_loss = self.perceptual_loss(reconstructed, input_images)
+        
+        # GAN loss (generator)
+        gan_loss = F.softplus(-discriminator_fake).mean()
+        
+        # Total loss
+        total_loss = (self.recon_weight * recon_loss + 
+                     self.perceptual_weight * perceptual_loss + 
+                     self.gan_weight * gan_loss)
+        
+        return total_loss, {
+            'recon_loss': recon_loss,
+            'perceptual_loss': perceptual_loss,
+            'gan_loss': gan_loss
+        }
 
 
-# def training_step(
-#     model: TexTok,
-#     batch: Dict[str, torch.Tensor],
-#     captions: List[str],
-#     optimizer: torch.optim.Optimizer,
-#     disc: Optional[nn.Module] = None,
-#     disc_optim: Optional[torch.optim.Optimizer] = None,
-#     loss_fn: Optional[TexTokLoss] = None,
-# ) -> Dict[str, float]:
-#     """
-#     batch["images"]: (B,3,H,W) in [0,1]
-#     captions: list[str] of length B
-#     """
-#     if loss_fn is None:
-#         loss_fn = TexTokLoss()
-
-#     images = batch["images"]
-#     # --- G step ---
-#     optimizer.zero_grad(set_to_none=True)
-#     Z, recon = model(images, captions)
-#     g_loss, g_logs = loss_fn(recon, images, disc=disc)
-#     g_loss.backward()
-#     optimizer.step()
-
-
-#     print(g_loss)
-
-#     logs = {"g_loss": g_loss.item(), **g_logs}
-
-#     # --- D step (optional) ---
-#     if disc is not None and disc_optim is not None:
-#         disc_optim.zero_grad(set_to_none=True)
-#         d_loss, r1 = loss_fn.disc_loss(disc, images, recon.detach())
-#         d_loss.backward()
-#         disc_optim.step()
-#         logs.update({"d_loss": d_loss.item(), "r1": r1.item()})
-
-#     return logs
-
-
-# # ----------------------------
-# # Quick smoke test
-# # ----------------------------
-# if __name__ == "__main__":
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-#     B, H, W = 2, 256, 256
-
-#     model = TexTok(
-#         img_res=H, patch=8, dim=768, depth=12, heads=12, mlp_dim=3072,
-#         num_image_tokens=128, out_token_dim=8, t5_model="t5-large", freeze_t5=True
-#     ).to(device)
-
-#     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.0, 0.99))
-
-#     # Optional discriminator
-#     disc = TinyPatchGAN().to(device)
-#     disc_opt = torch.optim.AdamW(disc.parameters(), lr=1e-4, betas=(0.0, 0.99))
-
-#     # Fake data
-#     images = torch.rand(B, 3, H, W, device=device)
-#     captions = [
-#         "A playful Pembroke Welsh Corgi trots through a sunlit field.",
-#         "A vibrant scarlet macaw perched on a branch amidst green foliage."
-#     ]
-
-#     logs = training_step(
-#         model,
-#         {"images": images},
-#         captions,
-#         optimizer=opt,
-#         disc=disc,
-#         disc_optim=disc_opt,
-#         loss_fn=TexTokLoss(lambda_perc=0.1, lambda_adv=0.1, r1_gamma=10.0, use_lpips=False),
-#     )
-#     print({k: round(v, 4) for k, v in logs.items()})
+if __name__ == "__main__":
+    # Example configuration
+    config = {
+        'img_size': 256,
+        'patch_size': 8,
+        'num_tokens': 128,
+        'token_dim': 8,
+        'embed_dim': 768,
+        'depth': 12,
+        'num_heads': 12,
+        'text_encoder_name': 't5-large',
+        'max_text_len': 128
+    }
+    
+    # Create model
+    model = create_textok_model(config)
+    discriminator = StyleGANDiscriminator(img_size=256)
+    
+    # Example forward pass
+    batch_size = 4
+    images = torch.randn(batch_size, 3, 256, 256)
+    captions = [
+        "A red car driving on a highway",
+        "A cat sitting on a table", 
+        "A mountain landscape with snow",
+        "A person walking in a park"
+    ]
+    
+    # Forward pass
+    reconstructed, tokens = model(images, captions)
+    print(f"Input shape: {images.shape}")
+    print(f"Tokens shape: {tokens.shape}")
+    print(f"Reconstructed shape: {reconstructed.shape}")
+    
+    # Discriminator outputs
+    disc_real = discriminator(images)
+    disc_fake = discriminator(reconstructed.detach())
+    print(f"Discriminator real: {disc_real.shape}")
+    print(f"Discriminator fake: {disc_fake.shape}")

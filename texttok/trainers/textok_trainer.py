@@ -10,8 +10,11 @@ from tqdm import tqdm
 # import constant_learnign rate swith warm up
 import logging
 from .utils.base_trainer import BaseTrainer
-from ..loss import TexTokLoss
+from ..loss import TexTokTrainingLoss
 from ..ema import EMA
+from ..models.model import StyleGANDiscriminator
+
+
 
 
 
@@ -19,27 +22,7 @@ def set_requires_grad(m, flag: bool):
     for p in m.parameters():
         p.requires_grad = flag
 
-# ----------------------------
-# Optional: a tiny PatchGAN-style discriminator (very light)
-# ----------------------------
 
-class TinyPatchGAN(nn.Module):
-    def __init__(self, in_ch=3, base=64):
-        super().__init__()
-        # Downsample to a patch map of logits
-        def block(c_in, c_out):
-            return nn.Sequential(
-                nn.Conv2d(c_in, c_out, 4, 2, 1),
-                nn.LeakyReLU(0.2, inplace=True)
-            )
-        self.net = nn.Sequential(
-            block(in_ch, base),
-            block(base, base*2),
-            block(base*2, base*4),
-            nn.Conv2d(base*4, 1, 3, 1, 1)
-        )
-    def forward(self, x):
-        return self.net(x)  # (B,1,h',w')
 
 
 
@@ -61,28 +44,41 @@ class TexTokTrainer(BaseTrainer):
 			decay_steps = self.num_training_steps
 
 
-		self.optim = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.0, 0.99))
+		# Hard-coded optimizer (Adam with paper's settings)
+		self.optim = torch.optim.Adam(
+			self.model.parameters(),
+			lr=1e-4,
+			betas=(0.0, 0.99),
+			weight_decay=0.0
+		)
 
-		self.disc = TinyPatchGAN().to(self.device)
+		# Hard-coded scheduler: linear warmup then constant
+		self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+			self.optim,
+			lambda step: min((step + 1) / (0.01 * decay_steps), 1.0)
+		)
 
-
-		self.loss_func = TexTokLoss(lambda_perc=0.1, lambda_adv=0.1, r1_gamma=10.0, use_lpips=True)
-
-
-		self.disc_optim = torch.optim.AdamW(self.disc.parameters(), lr=1e-4, betas=(0.0, 0.99))
-
+		# Hard-coded loss function
+		self.loss_fn = TexTokTrainingLoss(
+			recon_weight=1.0,
+			perceptual_weight=0.1,
+			gan_weight=0.1,
+			lecam_weight=0.0001
+		)
 
 	
-		
-
-		# self.scheduler = get_scheduler(cfg, self.optim, decay_steps=decay_steps)
 
 		# prepare model, optimizer, and dataloader for distributed training
-		self.model, self.disc, self.optim, self.disc_optim, self.train_dl, self.val_dl = \
-			self.accelerator.prepare(
-				self.model, self.disc, self.optim, self.disc_optim, self.train_dl, self.val_dl
-			)
+		self.model, self.optim, self.scheduler, self.train_dl, self.val_dl = self.accelerator.prepare(
+			self.model, 
+			self.optim, 
+			self.scheduler, 
+			self.train_dl, 
+			self.val_dl
+		)
 		
+
+
 
 		self.use_ema = True
 		if self.use_ema:
@@ -97,121 +93,189 @@ class TexTokTrainer(BaseTrainer):
 			self.ema = None
 
 
-
-
-
-
-
 	def train(self):
-		start_epoch=self.global_step//len(self.train_dl)
-	  
+		start_epoch = self.global_step // len(self.train_dl)
+		
+		# Initialize discriminator
+		self.discriminator = StyleGANDiscriminator(img_size=256).to(self.device)
+		
+		# Discriminator optimizer
+		self.optim_d = torch.optim.Adam(
+			self.discriminator.parameters(),
+			lr=1e-4,
+			betas=(0.0, 0.99),
+			weight_decay=0.0
+		)
+		
+		# Prepare discriminator and its optimizer
+		self.discriminator, self.optim_d = self.accelerator.prepare(self.discriminator, self.optim_d)
+		
+		# Training settings
+		discriminator_start_step = 80000
+		r1_every = 16
+		
 		for epoch in range(start_epoch, self.num_epoch):
 			with tqdm(self.train_dl, dynamic_ncols=True, disable=not self.accelerator.is_main_process) as train_dl:
 				for batch in train_dl:
 					images, captions = batch
-
 					images = images.to(self.device)
 				
+					# =========================
+					# GENERATOR TRAINING STEP
+					# =========================
 					with self.accelerator.accumulate(self.model):
-						with self.accelerator.autocast():
-							recon = self.model(images, captions)
+						set_requires_grad(self.discriminator, False)  # Freeze discriminator
 						
-						# G step
-						# compute loss
-						# set_requires_grad(self.disc, False) 
 						self.optim.zero_grad(set_to_none=True)
+						
 						with self.accelerator.autocast():
-							g_loss, _  = self.loss_func(recon, images, disc=None)
+							recon, tokens = self.model(images, captions)
+							
+							# Get discriminator predictions for fake images
+							if self.global_step >= discriminator_start_step:
+								fake_pred = self.discriminator(recon)
+								g_loss, g_loss_dict = self.loss_fn.compute_generator_loss(
+									images, recon, fake_pred
+								)
+							else:
+								# Only reconstruction loss before discriminator starts
+								g_loss = F.mse_loss(recon, images)
+								g_loss_dict = {'recon_loss': g_loss.item()}
+						
 						self.accelerator.backward(g_loss)
+						
 						if self.accelerator.sync_gradients and self.max_grad_norm:
 							self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+						
 						self.optim.step()
-						          
-						# 🔥 EMA UPDATE - This is the key addition!
+						
+						# EMA update
 						if self.use_ema and self.accelerator.sync_gradients:
-							# Update EMA after optimizer step
 							unwrapped_model = self.accelerator.unwrap_model(self.model)
 							self.ema.update(unwrapped_model)
+						
+						self.scheduler.step()
 
-						# self.scheduler.step(self.global_step)
+					# =========================
+					# DISCRIMINATOR TRAINING STEP
+					# =========================
+					d_loss = torch.tensor(0.0, device=self.device)
+					d_loss_dict = {}
 					
+					if self.global_step >= discriminator_start_step:
+						with self.accelerator.accumulate(self.discriminator):
+							set_requires_grad(self.discriminator, True)  # Unfreeze discriminator
+							
+							self.optim_d.zero_grad(set_to_none=True)
+							
+							with self.accelerator.autocast():
+								real_pred = self.discriminator(images)
+								fake_pred = self.discriminator(recon.detach())  # Detach to avoid generator gradients
+								
+								# Apply R1 regularization periodically
+								apply_r1 = (self.global_step % r1_every == 0)
+								
+								if apply_r1:
+									images_for_r1 = images.clone().detach().requires_grad_(True)
+									real_pred_for_r1 = self.discriminator(images_for_r1)
+									d_loss, d_loss_dict = self.loss_fn.compute_discriminator_loss(
+										real_pred_for_r1, fake_pred, images_for_r1, apply_r1=True
+									)
+								else:
+									d_loss, d_loss_dict = self.loss_fn.compute_discriminator_loss(
+										real_pred, fake_pred, apply_r1=False
+									)
+							
+							self.accelerator.backward(d_loss)
+							
+							if self.accelerator.sync_gradients and self.max_grad_norm:
+								self.accelerator.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+							
+							self.optim_d.step()
 
-
-						# # D step (optional)
-						# set_requires_grad(self.disc, True)  
-						# self.disc_optim.zero_grad(set_to_none=True)
-						# d_loss, r1 = loss_dict['d_loss'](self.disc, images, recon.detach())
-						# self.accelerator.backward(d_loss)
-						# if self.accelerator.sync_gradients:
-						# 	self.disc_optim.step()
-
+					# =========================
+					# LOGGING AND CHECKPOINTING
+					# =========================
 					if self.accelerator.sync_gradients:
-
 						if not (self.global_step % self.save_every):
 							self.save_ckpt(rewrite=True)
 						
 						if not (self.global_step % self.sample_every):
 							self.sample_prompts()
-      
-						# if not (self.global_step % self.eval_every):
-						# 	self.evaluate()
-						lr = self.optim.param_groups[0]['lr']
-						self.accelerator.log({"g_loss": g_loss.item(), 
-												# "d_loss": d_loss.item(),
-												# "r1": r1.item(),
-												"lr": lr}, step=self.global_step)
+						
+						# Prepare logging
+						log_dict = {
+							"g_loss": g_loss.item(),
+							"lr": self.optim.param_groups[0]['lr']
+						}
+						
+						# Add generator loss components
+						for key, value in g_loss_dict.items():
+							log_dict[f"g_{key}"] = value
+						
+						# Add discriminator losses if training
+						if self.global_step >= discriminator_start_step:
+							log_dict["d_loss"] = d_loss.item()
+							for key, value in d_loss_dict.items():
+								log_dict[f"d_{key}"] = value
+						
+						self.accelerator.log(log_dict, step=self.global_step)
 						self.global_step += 1
-	  
-					
+
 		self.accelerator.end_training()        
 		print("Train finished!")
-	
-	# @torch.no_grad()
-	# def sample_prompts(self):
-	# 	logging.info("Sampling prompts")
-	# 	self.model.eval()
-	# 	prompts = []
-	# 	with open("data/prompts/dalle_prompts.txt", "r") as f:
-	# 		for line in f:
-	# 			text = line.strip()
-	# 			prompts.append(text)
-	# 	imgs = self.model.generate(prompts)
-	# 	grid = make_grid(imgs, nrow=6, normalize=False, value_range=(-1, 1))
-	# 	# send this to wandb
-	# 	self.accelerator.log({"samples": [wandb.Image(grid, caption="Generated samples")]})
-	# 	save_image(grid, os.path.join(self.image_saved_dir, f'step.png'))
-	# 	self.model.train()
-  
+
   
 	@torch.no_grad()
 	def sample_prompts(self):
 		self.model.eval()
+		if hasattr(self, 'discriminator'):
+			self.discriminator.eval()
+		
 		with tqdm(self.val_dl, dynamic_ncols=True, disable=not self.accelerator.is_main_process) as val_dl:
+			all_originals = []
+			all_reconstructions = []
+			
 			for i, batch in enumerate(val_dl):
-				image, captions = batch
-				image = image.to(self.device)
-
-				if i > 3:
+				if i >= 4:  # Limit to 4 batches
 					break
 					
-				#  use the ema model
-				if self.use_ema:
-					# Use EMA model for inference
-					recon = self.ema.ema_model(image, captions)
+				images, captions = batch
+				images = images.to(self.device)
+				
+				# Use EMA model if available, otherwise use main model
+				if self.use_ema and self.ema is not None:
+					recon, _ = self.ema.ema_model(images, captions)
 				else:
-					# Use the original model
-					# recon = self.model(image, captions)
-					recon = self.model(image, captions)
-				# recon = self.model(image, captions)
-
-				grid = make_grid(recon, nrow=6, normalize=True, value_range=(-1, 1))
-				# grid = make_grid(recon, nrow=6, normalize=False)
-				# send this to wandb
-				self.accelerator.log({"samples": [wandb.Image(grid, caption="Generated samples")]})
-				save_image(grid, os.path.join(self.image_saved_dir, f'step_{i}.png'))
+					recon, _ = self.model(images, captions)
+				
+				# Take first 6 images from each batch
+				all_originals.append(images[:6])
+				all_reconstructions.append(recon[:6])
+			
+			if all_originals:
+				# Concatenate all images
+				originals = torch.cat(all_originals, dim=0)
+				reconstructions = torch.cat(all_reconstructions, dim=0)
+				
+				# Create side-by-side comparison: [orig1, recon1, orig2, recon2, ...]
+				comparison = torch.stack([originals, reconstructions], dim=1)
+				comparison = comparison.view(-1, *originals.shape[1:])
+				
+				# Create grid with originals and reconstructions alternating
+				grid = make_grid(comparison, nrow=12, normalize=True, value_range=(-1, 1), padding=2)
+				
+				# Log to wandb
+				self.accelerator.log({
+					"reconstructions": [wandb.Image(grid, caption="Original (left) vs Reconstructed (right)")]
+				}, step=self.global_step)
+				
+				# Save to disk
+				save_image(grid, os.path.join(self.image_saved_dir, f'reconstruction_step_{self.global_step}.png'))
+		
 		self.model.train()
-
-
+		if hasattr(self, 'discriminator'):
+			self.discriminator.train()
 
 
 
