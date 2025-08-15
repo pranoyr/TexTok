@@ -149,6 +149,7 @@ class TexTokTokenizer(nn.Module):
         # Extract only the image tokens
         start_idx = patch_tokens.shape[1]
         end_idx = start_idx + self.num_tokens
+
         image_tokens_out = tokens[:, start_idx:end_idx]
         
         # Project to final token dimension
@@ -215,22 +216,23 @@ class TexTokDetokenizer(nn.Module):
         # Project input tokens
         image_tokens_proj = self.token_proj(image_tokens)  # (B, num_tokens, embed_dim)
         text_tokens = self.text_proj(text_embeds)  # (B, text_len, embed_dim)
-        
+
         # Concatenate all tokens: [patch_tokens, image_tokens, text_tokens]
         tokens = torch.cat([patch_tokens, image_tokens_proj, text_tokens], dim=1)
-        
+
         # Add positional embeddings
         tokens = tokens + self.pos_embed[:, :tokens.shape[1], :]
+
         
         # Apply transformer blocks
         for block in self.blocks:
             tokens = block(tokens)
         
         tokens = self.norm(tokens)
-        
+
         # Extract only the patch tokens
-        patch_tokens_out = tokens[:, :self.num_patches]
-        
+        patch_tokens_out = tokens[:, :self.num_patches, :]
+
         # Project to pixel space
         patch_tokens_out = self.output_proj(patch_tokens_out)
         
@@ -308,10 +310,10 @@ class TexTokVAE(nn.Module):
             input_ids = captions
             attention_mask = None
             
-        # Get text embeddings
-        with torch.no_grad():
-            outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-            text_embeds = outputs.last_hidden_state
+        # # Get text embeddings
+        # with torch.no_grad():
+        outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_embeds = outputs.last_hidden_state
             
         return text_embeds
         
