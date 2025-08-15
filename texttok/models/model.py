@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import T5EncoderModel, T5Tokenizer
 import math
+from einops import rearrange, repeat
 
 
 class PatchEmbed(nn.Module):
@@ -19,7 +20,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         x = self.proj(x)  # (B, embed_dim, H//patch_size, W//patch_size)
-        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        x = rearrange(x, 'b c h w -> b (h w) c')  # (B, num_patches, embed_dim)
         return x
 
 
@@ -199,9 +200,10 @@ class TexTokDetokenizer(nn.Module):
         """Convert patch tokens back to image"""
         p = self.patch_size
         h = w = self.grid_size
-        x = x.reshape(x.shape[0], h, w, p, p, -1)
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(x.shape[0], -1, h * p, w * p)
+    
+        imgs = rearrange(x, 'b (h w) (p1 p2 c) -> b c (h p1) (w p2)',
+                         h=h, w=w, p1=p, p2=p, c=3)
+        
         return imgs
         
     def forward(self, image_tokens, text_embeds):
@@ -234,6 +236,8 @@ class TexTokDetokenizer(nn.Module):
         
         # Unpatchify to get final image
         images = self.unpatchify(patch_tokens_out)
+
+        images = torch.tanh(images)
         
         return images
 
