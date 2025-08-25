@@ -1,13 +1,13 @@
 experiment:
     project_name: textok
-    exp_name: run2
+    exp_name: resume_run1
     max_train_examples: 10000000000
     save_every: 1000
     eval_every: 50000000000000
     sample_every: 500
     log_every: 100
     log_level: info
-    resume_path_from_checkpoint: null
+    resume_path_from_checkpoint: outputs/textok/checkpoints/textok_resume_run1.pt
 
 model:
     name: textok
@@ -15,7 +15,7 @@ model:
 dataset:
     name: coco
     params:
-        root_path:  /mnt/datasets/coco-dataset/coco
+        root_path:  /media/pranoy/Datasets/coco-dataset/coco
         num_workers: 4
         pin_memory: True
         batch_size: 1
@@ -29,6 +29,8 @@ lr_scheduler:
     params:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 1000
+
+
         decay_steps: null
 
 training:

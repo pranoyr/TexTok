@@ -66,19 +66,30 @@ class TexTokTrainer(BaseTrainer):
 			lecam_weight=0.0001
 		)
 
-	
 
+		# Initialize discriminator
+		self.discriminator = StyleGANDiscriminator(img_size=256).to(self.device)
+		
+		# Discriminator optimizer
+		self.optim_d = torch.optim.Adam(
+			self.discriminator.parameters(),
+			lr=1e-4,
+			betas=(0.0, 0.99),
+			weight_decay=0.0
+		)
+		
+		
 		# prepare model, optimizer, and dataloader for distributed training
-		self.model, self.optim, self.scheduler, self.train_dl, self.val_dl = self.accelerator.prepare(
+		self.model, self.optim, self.discriminator, self.optim_d, self.scheduler, self.train_dl, self.val_dl = self.accelerator.prepare(
 			self.model, 
 			self.optim, 
+			self.discriminator,
+			self.optim_d,
 			self.scheduler, 
 			self.train_dl, 
 			self.val_dl
 		)
 		
-
-
 
 		self.use_ema = True
 		if self.use_ema:
@@ -92,28 +103,18 @@ class TexTokTrainer(BaseTrainer):
 		else:
 			self.ema = None
 
+		# load models
+		self.resume_from_checkpoint()
+
 
 	def train(self):
 		start_epoch = self.global_step // len(self.train_dl)
-		
-		# Initialize discriminator
-		self.discriminator = StyleGANDiscriminator(img_size=256).to(self.device)
-		
-		# Discriminator optimizer
-		self.optim_d = torch.optim.Adam(
-			self.discriminator.parameters(),
-			lr=1e-4,
-			betas=(0.0, 0.99),
-			weight_decay=0.0
-		)
-		
-		# Prepare discriminator and its optimizer
-		self.discriminator, self.optim_d = self.accelerator.prepare(self.discriminator, self.optim_d)
-		
+
 		# Training settings
 		discriminator_start_step = 80000
 		r1_every = 16
-		
+
+			
 		for epoch in range(start_epoch, self.num_epoch):
 			with tqdm(self.train_dl, dynamic_ncols=True, disable=not self.accelerator.is_main_process) as train_dl:
 				for batch in train_dl:

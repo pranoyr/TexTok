@@ -54,11 +54,6 @@ class BaseTrainer(object):
 		self.log_every = cfg.experiment.log_every
 		self.eval_every = cfg.experiment.eval_every
 		
-		# Resume from ckpt
-		if cfg.experiment.resume_path_from_checkpoint:
-			path = cfg.experiment.resume_path_from_checkpoint
-			self.resume_from_checkpoint(path)
-	
 	
 		# Checkpoint and generated images folder
 		output_folder = f"outputs/{cfg.experiment.project_name}"
@@ -95,7 +90,12 @@ class BaseTrainer(object):
 		
 		checkpoint={
 				'step': self.global_step,
-				'state_dict': self.accelerator.unwrap_model(self.model).state_dict(),
+				'g_state_dict': self.accelerator.unwrap_model(self.model).state_dict(),
+				'd_state_dict': self.accelerator.unwrap_model(self.discriminator).state_dict(),
+				'g_optimizer_state_dict':self.optim.state_dict(),
+				'd_optimizer_state_dict':self.optim_d.state_dict(),
+				'scheduler_state_dict': self.scheduler.state_dict(),
+				'ema_state_dict': self.ema.state_dict(),
 				'config': self.cfg
 
 			}
@@ -103,13 +103,30 @@ class BaseTrainer(object):
 		self.accelerator.save(checkpoint, filename)
 		logging.info("Saving checkpoint: %s ...", filename)
    
-   
-	def resume_from_checkpoint(self, checkpoint_path):
-		"""Resume from checkpoint"""
-		checkpoint = torch.load(checkpoint_path, weights_only=False)
-		self.global_step = checkpoint['step']
-		self.model.load_state_dict(checkpoint['state_dict'])
-		logging.info("Resume from checkpoint %s (global_step %d)", checkpoint_path, self.global_step)
+
+	def resume_from_checkpoint(self):
+		"""Resume from checkpoint with proper error handling"""
+		checkpoint_path = self.cfg.experiment.resume_path_from_checkpoint
+		
+		if checkpoint_path:
+			checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+			self.global_step = checkpoint['step']
+			self.model.load_state_dict(checkpoint['generator_state_dict'])
+			self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+			self.optim.load_state_dict(checkpoint['optimizer_state_dict'])
+			self.optim_d.load_state_dict(checkpoint['discriminator_optimizer_state_dict'])
+			self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+			
+			if 'ema_state_dict' in checkpoint:
+				self.ema.ema_model.load_state_dict(checkpoint['ema_state_dict'])
+				logging.info("Loaded EMA state from checkpoint.")
+				self.use_ema = True
+			else:
+				self.use_ema = False
+			
+			logging.info(f"Resumed from checkpoint: {checkpoint_path} at step {self.global_step}")
+		
+
 
 
 	@torch.no_grad()
