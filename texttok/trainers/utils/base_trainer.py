@@ -68,7 +68,17 @@ class BaseTrainer(object):
 		logging.info(f"Val dataset size: {len(self.val_dl.dataset)}")
 
 
-		self.num_training_steps = self.num_epoch * math.ceil(len(self.train_dl) / self.gradient_accumulation_steps)
+		num_processes = self.accelerator.num_processes
+		effective_batch_size = (self.batch_size * 
+                           self.gradient_accumulation_steps * 
+                           num_processes)
+		
+		# Calculate steps based on total dataset size
+		dataset_size = len(self.train_dl.dataset)  # Total samples before sharding
+		steps_per_epoch = math.ceil(dataset_size / effective_batch_size)
+		self.num_training_steps = self.num_epoch * steps_per_epoch
+			
+		logging.info(f"Effective batch size: {effective_batch_size}")
 		logging.info(f"Total training steps: {self.num_training_steps}")
 
 		
