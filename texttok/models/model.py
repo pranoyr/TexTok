@@ -311,8 +311,8 @@ class TexTokVAE(nn.Module):
             attention_mask = None
             
         # # Get text embeddings
-        # with torch.no_grad():
-        outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        with torch.no_grad():
+            outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
         text_embeds = outputs.last_hidden_state
             
         return text_embeds
