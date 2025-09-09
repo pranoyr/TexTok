@@ -150,11 +150,16 @@ class TexTokTrainer(BaseTrainer):
 						
 						self.optim.step()
 						
-						# EMA update
+						# # EMA update
+						# if self.use_ema and self.accelerator.sync_gradients:
+						# 	unwrapped_model = self.accelerator.unwrap_model(self.model)
+						# 	self.ema.update(unwrapped_model)
+
 						if self.use_ema and self.accelerator.sync_gradients:
-							unwrapped_model = self.accelerator.unwrap_model(self.model)
-							self.ema.update(unwrapped_model)
-						
+							if self.accelerator.is_main_process:  # Only update EMA on main process
+								unwrapped_model = self.accelerator.unwrap_model(self.model)
+								self.ema.update(unwrapped_model)
+												
 						self.scheduler.step()
 
 					# =========================
@@ -198,7 +203,7 @@ class TexTokTrainer(BaseTrainer):
 					# LOGGING AND CHECKPOINTING
 					# =========================
 					if self.accelerator.sync_gradients:
-						if not (self.global_step % self.save_every):
+						if not (self.global_step % self.save_every) and self.accelerator.is_main_process:
 							self.save_ckpt(rewrite=True)
 						
 						if not (self.global_step % self.sample_every):
