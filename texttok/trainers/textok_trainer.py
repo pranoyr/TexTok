@@ -13,6 +13,9 @@ from .utils.base_trainer import BaseTrainer
 from ..loss import TexTokTrainingLoss
 from ..ema import EMA
 from ..models.model import StyleGANDiscriminator
+import math
+
+from transformers import get_cosine_schedule_with_warmup
 
 
 
@@ -21,8 +24,6 @@ from ..models.model import StyleGANDiscriminator
 def set_requires_grad(m, flag: bool):
     for p in m.parameters():
         p.requires_grad = flag
-
-
 
 
 
@@ -36,14 +37,7 @@ class TexTokTrainer(BaseTrainer):
 		):
 		super().__init__(cfg, model, dataloaders)
   
-		# Training parameters
-		decay_steps = cfg.lr_scheduler.params.decay_steps
-
-  
-		if not decay_steps:
-			decay_steps = self.num_training_steps
-
-
+		
 		# Hard-coded optimizer (Adam with paper's settings)
 		self.optim = torch.optim.Adam(
 			self.model.parameters(),
@@ -52,11 +46,15 @@ class TexTokTrainer(BaseTrainer):
 			weight_decay=0.0
 		)
 
-		# Hard-coded scheduler: linear warmup then constant
-		self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-			self.optim,
-			lambda step: min((step + 1) / (0.01 * decay_steps), 1.0)
-		)
+		
+		steps_per_epoch = len(self.train_dl) // self.gradient_accumulation_steps
+		num_training_steps = self.num_epoch * steps_per_epoch
+
+		self.scheduler = get_cosine_schedule_with_warmup(
+				self.optim,
+				num_warmup_steps=4000,
+				num_training_steps=num_training_steps
+			)
 
 		# Hard-coded loss function
 		self.loss_fn = TexTokTrainingLoss(
@@ -107,6 +105,14 @@ class TexTokTrainer(BaseTrainer):
 		self.resume_from_checkpoint()
 
 
+		effective_steps_per_epoch = math.ceil(len(self.train_dl) / self.gradient_accumulation_steps)
+		effective_training_steps = self.num_epoch * effective_steps_per_epoch
+
+		logging.info(f"Effective batch size per device: {self.batch_size * self.gradient_accumulation_steps}")
+		logging.info(f"Effective Total training steps: {effective_training_steps}")
+
+
+
 	def train(self):
 		start_epoch = self.global_step // len(self.train_dl)
 
@@ -150,11 +156,7 @@ class TexTokTrainer(BaseTrainer):
 						
 						self.optim.step()
 						
-						# # EMA update
-						# if self.use_ema and self.accelerator.sync_gradients:
-						# 	unwrapped_model = self.accelerator.unwrap_model(self.model)
-						# 	self.ema.update(unwrapped_model)
-
+				
 						if self.use_ema and self.accelerator.sync_gradients:
 							if self.accelerator.is_main_process:  # Only update EMA on main process
 								unwrapped_model = self.accelerator.unwrap_model(self.model)

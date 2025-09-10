@@ -63,25 +63,7 @@ class BaseTrainer(object):
 		self.image_saved_dir = os.path.join(output_folder, 'images')
 		os.makedirs(self.image_saved_dir, exist_ok=True)
 
-
-		logging.info(f"Train dataset size: {len(self.train_dl.dataset)}")
-		logging.info(f"Val dataset size: {len(self.val_dl.dataset)}")
-
-
-		num_processes = self.accelerator.num_processes
-		effective_batch_size = (self.batch_size * 
-                           self.gradient_accumulation_steps * 
-                           num_processes)
-		
-		# Calculate steps based on total dataset size
-		dataset_size = len(self.train_dl.dataset)  # Total samples before sharding
-		steps_per_epoch = math.ceil(dataset_size / effective_batch_size)
-		self.num_training_steps = self.num_epoch * steps_per_epoch
-			
-		logging.info(f"Effective batch size: {effective_batch_size}")
-		logging.info(f"Total training steps: {self.num_training_steps}")
-
-		
+	
 	@property
 	def device(self):
 		return self.accelerator.device
@@ -130,8 +112,6 @@ class BaseTrainer(object):
 			
 			logging.info(f"Resumed from checkpoint: {checkpoint_path} at step {self.global_step}")
 		
-
-
 
 	@torch.no_grad()
 	def evaluate(self):
