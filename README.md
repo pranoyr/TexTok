@@ -6,7 +6,7 @@ A PyTorch implementation of **TexTok: Text-Conditioned Image Tokenization for Ge
 ### Training Script
 
 ```bash
-python train.py config=texttok/cfg/trial1.yaml
+python train.py
 ```
 
 
